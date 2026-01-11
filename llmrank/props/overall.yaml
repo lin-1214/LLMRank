@@ -1,5 +1,5 @@
 eval_args:
-  split: {'LS': 'valid_and_test'}
+  split: {'RS': [0.8, 0.0, 0.2]}
   order: TO
   mode: full
 repeatable: True
@@ -8,7 +8,7 @@ loss_type: CE
 train_batch_size: 4096
 eval_batch_size: 100
 valid_metric: NDCG@10
-metrics: ["Recall", "NDCG"]
+metrics: ["Hit", "NDCG"]
 topk: [1, 5, 10, 20, 50]
 
 train_neg_sample_args: ~

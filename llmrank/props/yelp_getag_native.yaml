@@ -1,0 +1,7 @@
+load_col:
+    inter: [user_id, item_id, timestamp]
+eval_args:
+    split: {'LS': 'test_only'}
+    order: TO
+    group_by: user
+    mode: full

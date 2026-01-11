@@ -1,5 +1,5 @@
-# OpenAI API
-api_name: 'gpt-3.5-turbo'
+# OpenAI API (OpenRouter)
+api_name: 'openai/gpt-3.5-turbo'
 max_tokens: 512
 api_batch: 8
 temperature: 0.2

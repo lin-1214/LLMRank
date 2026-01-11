@@ -26,7 +26,7 @@ async def dispatch_openai_requests(
     temperature: float
 ):
     """Dispatches requests to OpenAI API asynchronously.
-    
+
     Args:
         messages_list: List of messages to be sent to OpenAI ChatCompletion API.
         model: OpenAI model to use.
@@ -40,7 +40,8 @@ async def dispatch_openai_requests(
         openai.ChatCompletion.acreate(
             model=model,
             messages=x,
-            temperature=temperature
+            temperature=temperature,
+            request_timeout=20  # 20 second timeout per request
         )
         for x in messages_list
     ]

@@ -1,2 +1,2 @@
-api_base: "https://api.openai.com/v1"
-api_key: ""
+api_base: "https://openrouter.ai/api/v1"
+api_key: "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"

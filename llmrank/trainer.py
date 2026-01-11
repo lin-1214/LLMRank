@@ -60,6 +60,8 @@ class SelectedUserTrainer(Trainer):
         unsorted_selected_pos_i.sort(key=lambda t: t[1])
         selected_interactions = [_[0] for _ in unsorted_selected_interactions]
         selected_pos_i = [_[0] for _ in unsorted_selected_pos_i]
+        # Extract row indices (pr values) for indexing into sampled_items
+        selected_row_indices = [_[1] for _ in unsorted_selected_pos_i]
         new_inter = {
             col: torch.stack([inter[col] for inter in selected_interactions]) for col in selected_interactions[0].columns
         }
@@ -70,7 +72,9 @@ class SelectedUserTrainer(Trainer):
         if self.config['has_gt']:
             self.logger.info('Has ground truth.')
             idxs = torch.LongTensor(self.sampled_items)
-            for i in range(idxs.shape[0]):
+            # Filter idxs to only include test users (using row indices, not token IDs)
+            idxs = idxs[selected_row_indices]
+            for i in range(len(selected_pos_i)):
                 if selected_pos_i[i] in idxs[i]:
                     pr = idxs[i].numpy().tolist().index(selected_pos_i[i].item())
                     idxs[i][pr:-1] = torch.clone(idxs[i][pr+1:])

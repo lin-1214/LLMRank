@@ -39,7 +39,10 @@ class Rank(SequentialRecommender):
 
     def load_text(self):
         token_text = {}
+        token_preferences = {}  # Store preference tags separately
         item_text = ['[PAD]']
+        self.item_preferences = {}  # item_index -> list of preference tags
+
         feat_path = osp.join(self.data_path, f'{self.dataset_name}.item')
         if self.dataset_name in ['ml-1m', 'ml-1m-full']:
             with open(feat_path, 'r', encoding='utf-8') as file:
@@ -67,6 +70,53 @@ class Rank(SequentialRecommender):
                 raw_text = token_text[token]
                 item_text.append(raw_text)
             return item_text
+        elif self.dataset_name.startswith(('food_', 'movie_', 'amazon_', 'yelp_')):
+            # Universal handler for food, movie, amazon, yelp with any tag variant
+            with open(feat_path, 'r', encoding='utf-8') as file:
+                file.readline()
+                for line in file:
+                    parts = line.strip().split('\t')
+                    if len(parts) >= 3:
+                        item_id, item_name, tags = parts[0], parts[1], parts[2]
+                        tag_list = tags.split()
+
+                        # Separate preference tags from native tags
+                        preference_tags = []
+                        native_tags = []
+                        for tag in tag_list:
+                            # Check for both English and Chinese preference suffixes
+                            if ' Preference' in tag or '偏好' in tag:
+                                # Remove the suffix to get the clean preference name
+                                clean_tag = tag.replace(' Preference', '').replace('偏好', '')
+                                preference_tags.append(clean_tag)
+                            else:
+                                native_tags.append(tag)
+
+                        # Store native tags with item name
+                        if native_tags:
+                            token_text[item_id] = f"{item_name} ({' '.join(native_tags)})"
+                        else:
+                            token_text[item_id] = item_name
+
+                        # Store preference tags separately
+                        if preference_tags:
+                            token_preferences[item_id] = preference_tags
+
+                    elif len(parts) == 2:
+                        item_id, item_name = parts
+                        token_text[item_id] = item_name
+
+            # Build item_text list and map preferences to indices
+            for i, token in enumerate(self.id_token):
+                if token == '[PAD]': continue
+                raw_text = token_text.get(token, f'Item_{token}')
+                item_text.append(raw_text)
+
+                # Map preference tags to item index
+                if token in token_preferences:
+                    self.item_preferences[len(item_text) - 1] = token_preferences[token]
+
+            return item_text
         else:
             raise NotImplementedError()
 
@@ -90,9 +140,9 @@ class Rank(SequentialRecommender):
 
         prompt_list = []
         for i in tqdm(range(batch_size)):
-            user_his_text, candidate_text, candidate_text_order, candidate_idx = self.get_batch_inputs(interaction, idxs, i)
+            user_his_text, candidate_text, candidate_text_order, candidate_idx, session_pref_counts, candidate_prefs = self.get_batch_inputs(interaction, idxs, i)
 
-            prompt = self.construct_prompt(self.dataset_name, user_his_text, candidate_text_order)
+            prompt = self.construct_prompt(self.dataset_name, user_his_text, candidate_text_order, session_pref_counts, candidate_prefs)
             prompt_list.append([{'role': 'user', 'content': prompt}])
 
         if 'llama' in self.api_model_name:
@@ -104,7 +154,7 @@ class Rank(SequentialRecommender):
         for i, openai_response in enumerate(tqdm(openai_responses)):
             retry_flag = 1
             while retry_flag >= 0:
-                user_his_text, candidate_text, candidate_text_order, candidate_idx = self.get_batch_inputs(interaction, idxs, i)
+                user_his_text, candidate_text, candidate_text_order, candidate_idx, session_pref_counts, candidate_prefs = self.get_batch_inputs(interaction, idxs, i)
 
                 if 'llama' in self.api_model_name:
                     response = openai_response
@@ -122,8 +172,11 @@ class Rank(SequentialRecommender):
                 elif self.dataset_name in ['Games', 'Games-6k']:
                     # rec_item_idx_list = self.parsing_output_indices(scores, i, response_list, idxs, candidate_text)
                     rec_item_idx_list = self.parsing_output_text(scores, i, response_list, idxs, candidate_text)
+                elif self.dataset_name.startswith(('food_', 'movie_', 'amazon_', 'yelp_')):
+                    # Use text parsing for food, movie, amazon, yelp datasets
+                    rec_item_idx_list = self.parsing_output_text(scores, i, response_list, idxs, candidate_text)
                 else:
-                    raise NotImplementedError()
+                    raise NotImplementedError(f"Dataset {self.dataset_name} not supported")
 
                 if int(pos_items[i % origin_batch_size]) in candidate_idx:
                     target_text = candidate_text[candidate_idx.index(int(pos_items[i % origin_batch_size]))]
@@ -156,6 +209,8 @@ class Rank(SequentialRecommender):
         return scores
 
     def get_batch_inputs(self, interaction, idxs, i):
+        from collections import Counter
+
         user_his = interaction[self.ITEM_SEQ]
         user_his_len = interaction[self.ITEM_SEQ_LEN]
         origin_batch_size = user_his.size(0)
@@ -168,20 +223,96 @@ class Rank(SequentialRecommender):
                 for j in range(idxs.shape[1])]
         candidate_idx = idxs[i].tolist()
 
-        return user_his_text, candidate_text, candidate_text_order, candidate_idx
+        # Extract preference tags from history and count session-level frequencies
+        session_pref_counts = Counter()
+        for j in range(real_his_len):
+            item_idx = user_his[i % origin_batch_size, user_his_len[i % origin_batch_size].item() - real_his_len + j].item()
+            if item_idx in self.item_preferences:
+                for pref in self.item_preferences[item_idx]:
+                    session_pref_counts[pref] += 1
 
-    def construct_prompt(self, dataset_name, user_his_text, candidate_text_order):
+        # Extract preference tags from candidates
+        candidate_prefs = []
+        for j in range(idxs.shape[1]):
+            item_idx = idxs[i,j].item()
+            if item_idx in self.item_preferences:
+                candidate_prefs.append(self.item_preferences[item_idx])
+            else:
+                candidate_prefs.append([])
+
+        return user_his_text, candidate_text, candidate_text_order, candidate_idx, session_pref_counts, candidate_prefs
+
+    def construct_prompt(self, dataset_name, user_his_text, candidate_text_order, session_pref_counts=None, candidate_prefs=None):
+        # Build session preference summary if available
+        pref_section = ""
+        if session_pref_counts and len(session_pref_counts) > 0:
+            pref_summary = "\n".join([f"  - {pref}: {count} items" for pref, count in session_pref_counts.most_common()])
+
+        # Build candidate list with preference alignment if available
+        candidate_display = candidate_text_order
+        if candidate_prefs and session_pref_counts and len(session_pref_counts) > 0:
+            # Reconstruct candidate list with preference information
+            candidate_lines = candidate_text_order.split('\n') if isinstance(candidate_text_order, str) else candidate_text_order
+            enhanced_candidates = []
+            for idx, (cand_text, cand_prefs) in enumerate(zip(candidate_lines, candidate_prefs)):
+                if cand_prefs:
+                    # Show which preferences match session
+                    matching = [p for p in cand_prefs if p in session_pref_counts]
+                    if matching:
+                        pref_str = ", ".join(matching)
+                        enhanced_candidates.append(f"{cand_text}\n   [Matching visitor patterns: {pref_str}]")
+                    else:
+                        enhanced_candidates.append(cand_text)
+                else:
+                    enhanced_candidates.append(cand_text)
+            candidate_display = '\n'.join(enhanced_candidates)
+        elif isinstance(candidate_text_order, list):
+            candidate_display = '\n'.join(candidate_text_order)
+
         if dataset_name in ['ml-1m', 'ml-1m-full']:
             prompt = f"I've watched the following movies in the past in order:\n{user_his_text}\n\n" \
-                    f"Now there are {self.recall_budget} candidate movies that I can watch next:\n{candidate_text_order}\n" \
+                    f"Now there are {self.recall_budget} candidate movies that I can watch next:\n{candidate_display}\n" \
                     f"Please rank these {self.recall_budget} movies by measuring the possibilities that I would like to watch next most, according to my watching history. Please think step by step.\n" \
                     f"Please show me your ranking results with order numbers. Split your output with line break. You MUST rank the given candidate movies. You can not generate movies that are not in the given candidate list."
         elif dataset_name in ['Games', 'Games-6k']:
             prompt = f"I've purchased the following products in the past in order:\n{user_his_text}\n\n" \
-                    f"Now there are {self.recall_budget} candidate products that I can consider to purchase next:\n{candidate_text_order}\n" \
+                    f"Now there are {self.recall_budget} candidate products that I can consider to purchase next:\n{candidate_display}\n" \
                     f"Please rank these {self.recall_budget} products by measuring the possibilities that I would like to purchase next most, according to the given purchasing records. Please think step by step.\n" \
                     f"Please show me your ranking results with order numbers. Split your output with line break. You MUST rank the given candidate movies. You can not generate movies that are not in the given candidate list."
                     # f"Please only output the order numbers after ranking. Split these order numbers with line break."
+        elif dataset_name.startswith('food_'):
+            # Food dataset (Chinese)
+            if session_pref_counts and len(session_pref_counts) > 0:
+                pref_summary = "\n".join([f"  - {pref}: {count} 項商品" for pref, count in session_pref_counts.most_common()])
+                pref_section = f"\n基於您的購買歷史,這個會話顯示出以下顧客偏好模式:\n{pref_summary}\n"
+            prompt = f"我過去按照順序購買了以下食品:\n{user_his_text}\n{pref_section}\n" \
+                    f"現在有 {self.recall_budget} 個候選食品可以考慮接下來購買:\n{candidate_display}\n" \
+                    f"請根據我的購買歷史和偏好模式,對這 {self.recall_budget} 個食品進行排序,衡量我最有可能接下來購買的食品。請逐步思考。\n" \
+                    f"請使用順序編號顯示您的排序結果。用換行符分隔輸出。您必須對給定的候選食品進行排序。您不能生成不在給定候選列表中的食品。"
+        elif dataset_name.startswith('movie_'):
+            # Movie dataset (English)
+            if session_pref_counts and len(session_pref_counts) > 0:
+                pref_section = f"\nBased on your viewing history, this session shows the following viewer preference patterns:\n{pref_summary}\n"
+            prompt = f"I've watched the following movies in the past in order:\n{user_his_text}\n{pref_section}\n" \
+                    f"Now there are {self.recall_budget} candidate movies that I can watch next:\n{candidate_display}\n" \
+                    f"Please rank these {self.recall_budget} movies by measuring the possibilities that I would like to watch next most, according to my watching history and preference patterns. Please think step by step.\n" \
+                    f"Please show me your ranking results with order numbers. Split your output with line break. You MUST rank the given candidate movies. You can not generate movies that are not in the given candidate list."
+        elif dataset_name.startswith('amazon_'):
+            # Amazon dataset (English)
+            if session_pref_counts and len(session_pref_counts) > 0:
+                pref_section = f"\nBased on your purchase history, this session shows the following shopper preference patterns:\n{pref_summary}\n"
+            prompt = f"I've purchased the following products in the past in order:\n{user_his_text}\n{pref_section}\n" \
+                    f"Now there are {self.recall_budget} candidate products that I can consider to purchase next:\n{candidate_display}\n" \
+                    f"Please rank these {self.recall_budget} products by measuring the possibilities that I would like to purchase next most, according to my purchase history and preference patterns. Please think step by step.\n" \
+                    f"Please show me your ranking results with order numbers. Split your output with line break. You MUST rank the given candidate products. You can not generate products that are not in the given candidate list."
+        elif dataset_name.startswith('yelp_'):
+            # Yelp dataset (English) - restaurants/businesses
+            if session_pref_counts and len(session_pref_counts) > 0:
+                pref_section = f"\nBased on your visit history, this session shows the following visitor preference patterns:\n{pref_summary}\n"
+            prompt = f"I've visited the following businesses in the past in order:\n{user_his_text}\n{pref_section}\n" \
+                    f"Now there are {self.recall_budget} candidate businesses that I can consider to visit next:\n{candidate_display}\n" \
+                    f"Please rank these {self.recall_budget} businesses by measuring the possibilities that I would like to visit next most, according to my visit history and preference patterns. Please think step by step.\n" \
+                    f"Please show me your ranking results with order numbers. Split your output with line break. You MUST rank the given candidate businesses. You can not generate businesses that are not in the given candidate list."
         else:
             raise NotImplementedError(f'Unknown dataset [{dataset_name}].')
         return prompt
@@ -192,15 +323,49 @@ class Rank(SequentialRecommender):
         if self.async_dispatch:
             self.logger.info('Asynchronous dispatching OpenAI API requests.')
             for i in tqdm(range(0, batch_size, self.api_batch)):
-                while True:
+                max_retries = 3
+                retry_count = 0
+                batch_num = i // self.api_batch
+                while retry_count < max_retries:
                     try:
-                        openai_responses += asyncio.run(
+                        batch_responses = asyncio.run(
                             dispatch_openai_requests(prompt_list[i:i+self.api_batch], self.api_model_name, self.temperature)
                         )
+                        openai_responses += batch_responses
+                        print(f'✓ Batch {batch_num}/{(batch_size-1)//self.api_batch} completed ({len(batch_responses)} responses)', flush=True)
+                        self.logger.info(f'Batch {batch_num} completed successfully with {len(batch_responses)} responses')
+                        # Log sample response - show the ranking part (last 300 chars which contains the numbered list)
+                        if batch_responses:
+                            full_content = batch_responses[0]['choices'][0]['message']['content'] if 'choices' in batch_responses[0] else 'N/A'
+                            # Extract just the ranking portion (lines starting with numbers)
+                            lines = full_content.split('\n')
+                            ranking_lines = [line for line in lines if line.strip() and (line.strip()[0].isdigit() or line.strip().startswith('0.'))]
+                            if ranking_lines:
+                                ranking_text = '\n'.join(ranking_lines[:10])  # Show first 10 ranked items
+                                self.logger.info(f'Sample ranking from batch {batch_num}:\n{ranking_text}')
+                            else:
+                                # Fallback: show last 300 chars
+                                self.logger.info(f'Sample response from batch {batch_num} (last 300 chars): ...{full_content[-300:]}')
                         break
                     except Exception as e:
-                        print(f'Error {e}, retry batch {i // self.api_batch} at {time.ctime()}', flush=True)
+                        retry_count += 1
+                        if retry_count >= max_retries:
+                            print(f'✗ Max retries ({max_retries}) reached for batch {batch_num}, adding fallback responses...', flush=True)
+                            self.logger.warning(f'Batch {batch_num} failed after {max_retries} retries, using fallback responses')
+                            # Add dummy responses to maintain batch alignment
+                            num_failed = min(self.api_batch, batch_size - i)
+                            for _ in range(num_failed):
+                                fallback_response = {
+                                    'choices': [{'message': {'content': '0\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19'}}],
+                                    'error': 'Max retries exceeded'
+                                }
+                                openai_responses.append(fallback_response)
+                            self.logger.warning(f'Added {num_failed} fallback responses for batch {batch_num}')
+                            break
+                        print(f'⚠ Error {e}, retry {retry_count}/{max_retries} for batch {batch_num} at {time.ctime()}', flush=True)
                         time.sleep(20)
+                # Small delay between batches to avoid rate limiting
+                time.sleep(0.1)
         else:
             self.logger.info('Dispatching OpenAI API requests one by one.')
             for message in tqdm(prompt_list):
